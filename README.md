@@ -20,5 +20,13 @@ By integrating remote sensing data, socio-economic indicators, and historical pl
 - ➤ Are historically marginalized areas (e.g., formerly redlined neighborhoods) disproportionately exposed to higher temperatures?  
 - ➤ How do extreme heatwave days in July 2025 exacerbate inequities?  
 - ➤ What interventions (tree canopy, cool roofs, cooling centers) could mitigate these inequities in the future?  
+- ➤ Has inequity in heat exposure persisted or shifted between 2010 and 2025?
+
+## Datasets:
+- Land Surface Temperature (LST) in summer 2025: Landsat 9 (30m) via GEE.
+- MODIS (1km): 2010-2025 summer averages via GEE
+- ACS 2020-2024 income, race, housing, age
+- NYC Open Data: tree canopy, impervious surfaces, zoning
+- HOLC Redlining Maps (1930s)
 
 
