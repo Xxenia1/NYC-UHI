@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # %%
 """
-Fetch ACS 5-year (2020–2024) tract-level data for New York City (state FIPS 36,
+Fetch ACS 5-year (2020 - 2024) tract-level data for New York City (state FIPS 36,
 counties: 005 Bronx, 047 Kings (Brooklyn), 061 New York (Manhattan),
 081 Queens, 085 Richmond (Staten Island)).
 
@@ -31,8 +31,11 @@ import json
 from pathlib import Path
 from urllib.parse import urlencode
 import urllib.request
+import pandas as pd
+import numpy as np
 
-YEARS = [2020, 2021, 2022, 2023, 2024]  # ACS 5-year vintages
+
+YEARS = [2020, 2021, 2022, 2023]  # ACS 5-year vintages
 STATE = "36"  # New York
 COUNTIES = {
     "005": "Bronx",
@@ -98,7 +101,7 @@ from json import JSONDecodeError
 def fetch_json(url: str, retries: int = 6, backoff: float = 1.6):
     """
     更稳健的抓取：处理 429/5xx、网络错误、返回非 JSON 的情况。
-    指数回退：1, 1.6, 2.56, ...
+    指数回退: 1, 1.6, 2.56, ...
     """
     for i in range(retries):
         try:
@@ -141,6 +144,19 @@ def to_int(x):
         return int(x)
     except:
         return None
+# data cleaning and processing moved into main()
+def clean_csv(file_path):
+    df = pd.read_csv(file_path)
+
+    # 替换 ACS 缺失值编码为 NaN
+    df = df.replace({
+        -666666666: np.nan,
+        -222222222: np.nan
+    })
+
+    # 保存覆盖
+    df.to_csv(file_path, index=False)
+    print(f"✅ Cleaned file saved: {file_path}")
 
 def main():
     out_dir = Path("data")
@@ -228,6 +244,7 @@ def main():
                 "pop_total","under5","age65plus","pct_under5","pct_65plus",
                 "hh_total","owner_occ","renter_occ","pct_owner","pct_renter"]
         year_path = out_dir / f"acs_nyc_tract_{year}.csv"
+        
         with open(year_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=cols)
             writer.writeheader()
@@ -249,6 +266,10 @@ def main():
         for r in all_rows_long:
             writer.writerow(r)
     print(f"Wrote {long_path} with {len(all_rows_long)} rows.")
+
+    # 🔹 清洗 long CSV
+    clean_csv(long_path)
+
 
     # Build wide CSV (year-suffixed columns)
     # Keep GEOID + static geography; year-specific variables suffixed by _YYYY
@@ -278,6 +299,8 @@ def main():
             writer.writerow(row)
 
     print(f"Wrote {wide_path} with {len(by_geo)} tracts.")
+    clean_csv(wide_path)
+
 
 if __name__ == "__main__":
     try:
