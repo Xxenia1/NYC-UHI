@@ -91,16 +91,43 @@ def build_url(year: int, vars_for_call: list, county: str, key: str | None) -> s
         params["key"] = key
     return f"{API_BASE.format(year=year)}?{urlencode(params)}"
 
-def fetch_json(url: str, retries: int = 3, backoff: float = 1.5):
+# —— 替换原 fetch_json —— 
+import urllib.error
+from json import JSONDecodeError
+
+def fetch_json(url: str, retries: int = 6, backoff: float = 1.6):
+    """
+    更稳健的抓取：处理 429/5xx、网络错误、返回非 JSON 的情况。
+    指数回退：1, 1.6, 2.56, ...
+    """
     for i in range(retries):
         try:
-            with urllib.request.urlopen(url) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data
-        except Exception as e:
-            if i == retries - 1:
-                raise
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "nyc-uhi-acs-fetch/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                # 2xx 正常
+                data = resp.read().decode("utf-8")
+            out = json.loads(data)
+            return out
+        except urllib.error.HTTPError as e:
+            # 429 限流/ 5xx 服务器错误：等待后重试
+            if e.code in (429, 500, 502, 503, 504):
+                time.sleep(backoff ** i)
+                continue
+            # 其它 HTTP 错误：抛出
+            raise
+        except (urllib.error.URLError, TimeoutError):
             time.sleep(backoff ** i)
+            continue
+        except JSONDecodeError:
+            # 有时返回 HTML 错页，等待再试
+            time.sleep(backoff ** i)
+            continue
+    # 多次重试失败：
+    raise RuntimeError(f"Failed to fetch after {retries} attempts: {url}")
+
 
 def chunks(lst, n):
     for i in range(0, len(lst), n):
@@ -127,20 +154,29 @@ def main():
 
     for year in YEARS:
         rows = []
-        for county in COUNTIES.keys():
-            url = build_url(year, var_codes, county, key)
+    for county in COUNTIES.keys():
+        url = build_url(year, var_codes, county, key)
+        try:
             data = fetch_json(url)
 
+            # 1) 校验返回
+            if not data or len(data) < 2:
+                print(f"[WARN] {year} {county} returned empty/short table.")
+                continue
+
+            # 2) 表头与索引
             headers = data[0]
-            # Build a mapping index for safety
             idx = {h: i for i, h in enumerate(headers)}
 
+            # 3) 逐行解析
             for rec in data[1:]:
-                row = {VARS[v]: to_int(rec[idx[v]]) if v in idx else None for v in var_codes}
+                row = {VARS[v]: to_int(rec[idx[v]]) if v in idx else None
+                       for v in var_codes}
                 state = rec[idx["state"]]
                 county_fips = rec[idx["county"]]
                 tract = rec[idx["tract"]]
                 geoid = f"{state}{county_fips}{tract}"
+
                 row.update({
                     "year": year,
                     "state": state,
@@ -149,17 +185,17 @@ def main():
                     "GEOID": geoid,
                     "borough": COUNTIES[county_fips]
                 })
-                # Derived metrics
-                race_total = row.get("race_total") or 0
-                eth_total = row.get("eth_total") or 0
-                pop_total = row.get("pop_total") or 0
-                hh_total = row.get("hh_total") or 0
 
-                # Percentages (guard divide-by-zero)
-                row["pct_white"]    = round((row.get("white_alone") or 0) / race_total * 100, 3) if race_total else None
-                row["pct_black"]    = round((row.get("black_alone") or 0) / race_total * 100, 3) if race_total else None
-                row["pct_asian"]    = round((row.get("asian_alone") or 0) / race_total * 100, 3) if race_total else None
-                row["pct_hispanic"] = round((row.get("hispanic_any") or 0) / eth_total * 100, 3) if eth_total else None
+                # —— 派生指标（防除零）——
+                race_total = row.get("race_total") or 0
+                eth_total  = row.get("eth_total") or 0
+                pop_total  = row.get("pop_total") or 0
+                hh_total   = row.get("hh_total") or 0
+
+                row["pct_white"]    = round((row.get("white_alone") or 0)/race_total*100,3) if race_total else None
+                row["pct_black"]    = round((row.get("black_alone") or 0)/race_total*100,3) if race_total else None
+                row["pct_asian"]    = round((row.get("asian_alone") or 0)/race_total*100,3) if race_total else None
+                row["pct_hispanic"] = round((row.get("hispanic_any") or 0)/eth_total*100,3) if eth_total else None
 
                 under5 = (row.get("male_under5") or 0) + (row.get("female_under5") or 0)
                 age65p = sum([(row.get(k) or 0) for k in [
@@ -168,13 +204,21 @@ def main():
                 ]])
                 row["under5"] = under5
                 row["age65plus"] = age65p
-                row["pct_under5"] = round(under5 / pop_total * 100, 3) if pop_total else None
-                row["pct_65plus"] = round(age65p / pop_total * 100, 3) if pop_total else None
-
-                row["pct_renter"] = round((row.get("renter_occ") or 0) / hh_total * 100, 3) if hh_total else None
-                row["pct_owner"]  = round((row.get("owner_occ") or 0) / hh_total * 100, 3) if hh_total else None
+                row["pct_under5"] = round(under5/pop_total*100,3) if pop_total else None
+                row["pct_65plus"] = round(age65p/pop_total*100,3) if pop_total else None
+                row["pct_renter"] = round((row.get("renter_occ") or 0)/hh_total*100,3) if hh_total else None
+                row["pct_owner"]  = round((row.get("owner_occ") or 0)/hh_total*100,3) if hh_total else None
 
                 rows.append(row)
+
+        except Exception as e:
+            print(f"[WARN] {year} county {county} fetch/process failed: {e}")
+            # 失败只跳过该 county，不影响下一个 county
+            continue
+
+    # ← 这里写当年的 CSV；即使有少数 county 失败，也会写成功的部分
+    # write_year_csv(rows, year)  # 保持你原来的写法
+
 
         # Write per-year CSV
         cols = ["year","GEOID","state","county","borough","tract",
@@ -194,7 +238,7 @@ def main():
         all_rows_long.extend(rows)
 
         # Be polite to the API
-        time.sleep(0.3)
+        time.sleep(0.6)
 
     # Write stacked long CSV
     long_path = out_dir / "acs_nyc_tract_2020_2024_long.csv"
