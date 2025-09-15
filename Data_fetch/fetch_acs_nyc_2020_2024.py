@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# %%
 """
 Fetch ACS 5-year (2020–2024) tract-level data for New York City (state FIPS 36,
 counties: 005 Bronx, 047 Kings (Brooklyn), 061 New York (Manhattan),
@@ -240,3 +241,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Cancelled by user.", file=sys.stderr)
         sys.exit(1)
+# %%
