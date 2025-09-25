@@ -1,138 +1,153 @@
-# pip install geopandas pandas pyproj shapely fiona
+# %% --------------- Imports & Setup ---------------
 from pathlib import Path
+import logging
 import re
 import pandas as pd
 import geopandas as gpd
 
-# ========= 1) 路径配置 =========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s | %(message)s"
+)
+
+pd.set_option("display.width", 180)
+pd.set_option("display.max_columns", 40)
+
+# %% --------------- Paths (改成你的) ---------------
 BASE = Path("/Users/xeniax/Desktop/Map Inspiration/NYC UHI")
 
-SHP_PATH  = BASE / "data/2020censusTract/nyct2020.shp"        # 你的 tract 面
-CSV_PATH  = BASE / "NYC-UHI/Data_fetch/data/acs_nyc_tract_2020_2024_wide.csv"  # 你的 ACS 宽表
-OUT_JOIN  = BASE / "data/2020censusTract/nyct2020_with_acs.gpkg"               # 连接后的输出
-OUT_AGG   = BASE / "data/2020censusTract/nyc_acs_nta_agg.gpkg"                 # 聚合后的输出
+SHP_PATH = BASE / "data/2020censusTract/nyct2020.shp"
+CSV_PATH = BASE / "NYC-UHI/Data_fetch/data/acs_nyc_tract_2020_2024_wide.csv"
 
-# 设定聚合层级字段（在 nyct2020.shp 里存在的字段）："NTA2020" 或 "BoroName" 等
-GROUP_FIELD = "NTA2020"   # 想聚合到 NTA 就用这个；要聚合到 Borough 可改成 "BoroName"
+OUT_GPKG_JOIN = BASE / "data/2020censusTract/nyct2020_with_acs.gpkg"
+OUT_GPKG_NTA  = BASE / "data/2020censusTract/nyc_acs_nta_agg.gpkg"
 
-# ========= 2) 读数据 =========
-gdf = gpd.read_file(SHP_PATH)
+GROUP_FIELD = "NTA2020"     # 想聚合到 NTA；如果改聚合到 Borough 则写 "BoroName"
+TRACT_ID_CANDIDATES = ("GEOID", "GEOID10", "CT2020")  # 逐个探测
 
-# 兼容 GDF 的 key 字段：GEOID / GEOID10 / CT2020 都有人用，这里做探测
-if "GEOID" in gdf.columns:
-    key_shp = "GEOID"
-elif "GEOID10" in gdf.columns:
-    key_shp = "GEOID10"
-elif "CT2020" in gdf.columns:
-    key_shp = "CT2020"
-else:
-    raise ValueError("在 shapefile 里找不到 GEOID/GEOID10/CT2020 之类的连接键。")
+# %% --------------- Helper: weighted average ---------------
+def weighted_avg(df: pd.DataFrame, value_col: str, weight_col: str) -> float | None:
+    v, w = df[value_col], df[weight_col]
+    w = pd.to_numeric(w, errors="coerce")
+    v = pd.to_numeric(v, errors="coerce")
+    if w.notna().sum() == 0 or w.fillna(0).sum() == 0:
+        return None
+    return (v * w).sum() / w.sum()
 
-# 读 CSV（把 GEOID 强制成字符串，避免丢前导 0）
-df = pd.read_csv(CSV_PATH, dtype={"GEOID": str, "GEOID10": str, "CT2020": str})
+# %% --------------- Main ---------------
+def main():
+    # 1) 读图层
+    gdf = gpd.read_file(SHP_PATH)
+    logging.info(f"Shapefile loaded: {len(gdf):,} rows, CRS={gdf.crs}")
 
-# 兼容 CSV 的 key 字段
-for k in ["GEOID", "GEOID10", "CT2020"]:
-    if k in df.columns:
-        key_csv = k
-        break
-else:
-    raise ValueError("在 CSV 里找不到 GEOID/GEOID10/CT2020 之类的连接键。")
+    # 2) 确认 tract 主键字段
+    tract_key = next((k for k in TRACT_ID_CANDIDATES if k in gdf.columns), None)
+    assert tract_key, f"在 {SHP_PATH.name} 里找不到 tract 主键字段 {TRACT_ID_CANDIDATES}"
+    logging.info(f"Detected tract key in shp: {tract_key}")
 
-# 统一成 11 位
-gdf[key_shp] = gdf[key_shp].astype(str).str.zfill(11)
-df[key_csv]  = df[key_csv].astype(str).str.zfill(11)
+    # 3) NTA/聚合字段必须存在
+    assert GROUP_FIELD in gdf.columns, f"聚合字段 {GROUP_FIELD} 不在 shapefile 属性表里"
+    # 4) 统一 tract 主键为 11 位字符串
+    gdf[tract_key] = gdf[tract_key].astype(str).str.zfill(11)
 
-# ========= 3) 连接 =========
-joined = gdf.merge(df, left_on=key_shp, right_on=key_csv, how="left")
+    # 5) 读 ACS 宽表
+    df = pd.read_csv(CSV_PATH, low_memory=False, dtype={ "GEOID": str, "GEOID10": str, "CT2020": str })
+    logging.info(f"CSV loaded: {df.shape}")
 
-# ========= 4) 字段类型清洗：把应为数值的列转为 numeric =========
-# 识别规则（尽量泛化）：包含这些模式的就当数值列
-numeric_like_patterns = [
-    r"(^|_)pop(_|$)",           # …pop_total, pop 等
-    r"(^|_)total(_|$)",         # …_total
-    r"(^|_)race(_|$)",
-    r"(^|_)owner(_|$)",
-    r"(^|_)renter(_|$)",
-    r"(^|_)male(_|$)",
-    r"(^|_)female(_|$)",
-    r"(^|_)age\d",              # age65plus 等
-    r"(^|_)med(ian)?(_|)inc",   # median_income / med_inc
-    r"(^|_)pct(_|$)",           # 百分比
-    r"(^|_)len(gth)?(_|$)",
-    r"(^|_)area(_|$)",
-    r"^\d{2}med_inco$"          # 见你截图的 20med_inco
-]
+    # 6) 找 CSV 的 tract 主键
+    csv_key = next((k for k in TRACT_ID_CANDIDATES if k in df.columns), None)
+    assert csv_key, f"在 CSV 里找不到 tract 主键字段 {TRACT_ID_CANDIDATES}"
+    logging.info(f"Detected tract key in CSV: {csv_key}")
 
-def looks_numeric(col: str) -> bool:
-    c = col.lower()
-    return any(re.search(p, c) for p in numeric_like_patterns)
+    df[csv_key] = df[csv_key].astype(str).str.zfill(11)
 
-# 可能的 ID/名称类字段（保持为字符串）
-id_like = {key_shp.lower(), key_csv.lower(), "nta2020", "ntaname", "boroname",
-           "ct2020", "borocode", "ctlabel", "cdtaname", "cdta2020", "boroct2020",
-           "puma"}
+    # 7) 粗检字段类型：把明显的数值列转数值
+    # 规则：数字开头/包含pop/total/pct/med 的列视为数值
+    numeric_like = [c for c in df.columns
+                    if c != csv_key and (
+                        re.search(r"^(pop|total|pct|med|median|hh|owner|renter|age)", c) or
+                        re.search(r"\d", c)
+                    )]
+    for c in numeric_like:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# 找出候选数值列，做 to_numeric（空串/非数字会变 NaN）
-num_cols = [c for c in joined.columns
-            if c.lower() not in id_like and looks_numeric(c)]
-for c in num_cols:
-    joined[c] = pd.to_numeric(joined[c], errors="coerce")
+    logging.info("Sample dtypes in CSV:")
+    logging.info(df[numeric_like[:12]].dtypes)
 
-# 建议：保存一个**干净版**（GeoPackage 避免 shapefile 限制）
-joined.to_file(OUT_JOIN, layer="tract_with_acs", driver="GPKG")
-print(f"✓ 连接+清洗完成：{OUT_JOIN}::tract_with_acs")
+    # 8) 左连接：把 NTA 等分组字段带入 tract 表
+    merged = df.merge(
+        gdf[[tract_key, GROUP_FIELD]],
+        left_on=csv_key, right_on=tract_key,
+        how="left", validate="m:1"
+    )
+    miss = merged[GROUP_FIELD].isna().mean()
+    logging.info(f"After join: {len(merged):,} rows; {miss:.1%} rows missing {GROUP_FIELD}")
+    assert miss < 0.02, f"有 {miss:.1%} 行找不到 {GROUP_FIELD}，多半是主键没对上（前导零/列名/年份）"
 
-# ========= 5) 聚合（到 NTA 或 Borough）=========
-# a) 定义权重字段（人口总数用来做加权平均）
-#   自动找类似 “…pop_total”的列；找不到时回退到 “pop_total”
-pop_weight_cols = [c for c in joined.columns if re.search(r"(^|_)pop_total(_|$)", c.lower())]
-POP_W = pop_weight_cols[0] if pop_weight_cols else "pop_total"
-if POP_W not in joined.columns:
-    # 尝试一个更保守的候选
-    raise ValueError("没找到人口总数字段（pop_total）。请手工把 POP_W 改成你表里的真实列名。")
+    # 9) 构建聚合方案：sum 列 vs 加权平均列
+    sum_cols  = [c for c in merged.columns if re.search(r"(pop|_total$|_count$)", c, re.I)]
+    # 注意：选择一个合理的权重列（优先用 2023 总人口；没有就 fallback）
+    weight_col_candidates = [c for c in merged.columns if re.fullmatch(r"pop_total_20\d{2}", c)]
+    weight_col = max(weight_col_candidates, default=None)
+    if not weight_col:
+        # 再退一步：找一个最“像”总人口的列
+        for guess in ["pop_total_2023", "pop_total_2022", "pop_total", "hh_total"]:
+            if guess in merged.columns:
+                weight_col = guess
+                break
+    assert weight_col, "没有找到作为权重的总人口列（例如 pop_total_2023）。请确认 CSV 字段。"
+    logging.info(f"Weight column: {weight_col}")
 
-# b) 识别“百分比/比例/率”列：以 pct_ 开头或包含 _pct_ 的列
-pct_cols = [c for c in num_cols if re.search(r"(^pct_|_pct_)", c.lower())]
+    # 比例/中位数类列：含 pct_ 或 med 字样，且不是 sum_cols
+    wavg_cols = [c for c in merged.columns
+                 if (("pct_" in c) or ("med" in c))
+                 and c not in sum_cols
+                 and c not in (tract_key, csv_key, GROUP_FIELD)]
 
-# c) 识别“收入”列：median_income / med_inco
-inc_cols = [c for c in num_cols if re.search(r"median(_|)inc|^..med_inco$", c.lower())]
+    # 10) 执行聚合（避免 groupby.apply 引发的 FutureWarning）
+    group = merged.groupby(GROUP_FIELD, dropna=False)
 
-# d) “总量”列：数值列里，剔除百分比与收入，剩下的就按 sum
-sum_cols = sorted(set(num_cols) - set(pct_cols) - set(inc_cols))
+    # 10.1 sum 聚合
+    agg_sum = group[sum_cols].sum(min_count=1)
 
-# 先准备一个 DataFrame 用于聚合（避免 geometry 参与 pandas 运算）
-df_attr = pd.DataFrame(joined.drop(columns=joined.geometry.name))
-df_attr["_w"] = df_attr[POP_W].fillna(0)
+    # 10.2 加权平均聚合（逐列计算）
+    agg_w = {}
+    for c in wavg_cols:
+        agg_w[c] = group.apply(lambda g: weighted_avg(g, c, weight_col))
+    agg_w = pd.DataFrame(agg_w)
 
-# ——— 聚合：总量 = sum ———
-agg_dict = {c: "sum" for c in sum_cols}
-grouped = df_attr.groupby(GROUP_FIELD, dropna=False).agg(agg_dict)
+    nta_agg = pd.concat([agg_sum, agg_w], axis=1).reset_index()
 
-# ——— 聚合：百分比 = 加权平均（按人口）———
-def wavg(group, col, wcol):
-    v = group[col]
-    w = group[wcol]
-    num = (v * w).sum(skipna=True)
-    den = w.sum(skipna=True)
-    return (num / den) if den and den != 0 else pd.NA
+    # 11) 结果自检
+    logging.info(f"NTA aggregated: {nta_agg.shape}")
+    logging.info(nta_agg.head(6))
 
-for c in pct_cols:
-    grouped[c] = df_attr.groupby(GROUP_FIELD, dropna=False).apply(lambda g: wavg(g, c, "_w"))
+    # 数值全 NA 的列列出来，方便你排查
+    all_na = [c for c in nta_agg.columns if nta_agg[c].isna().all() and c != GROUP_FIELD]
+    if all_na:
+        logging.warning(f"{len(all_na)} 列在聚合后全是 NA（可能原始列是字符串/全空）：{all_na[:10]}...")
 
-# ——— 聚合：收入 = 加权平均（同样按人口；若你更偏好用户数可把 POP_W 换成 hh_total）———
-for c in inc_cols:
-    grouped[c] = df_attr.groupby(GROUP_FIELD, dropna=False).apply(lambda g: wavg(g, c, "_w"))
+    # 12) 写回 GPKG（也把 tract+ACS 的 join 结果先写一份，便于 QGIS 检查）
+    # 12.1 写 join 结果
+    joined_gdf = gdf.merge(
+        df, left_on=tract_key, right_on=csv_key, how="left", validate="1:m"
+    )
+    joined_gdf.to_file(OUT_GPKG_JOIN, layer="tract_with_acs", driver="GPKG")
+    logging.info(f"Saved joined layer → {OUT_GPKG_JOIN}::tract_with_acs")
 
-grouped = grouped.reset_index()
+    # 12.2 写 NTA 聚合结果（仅属性表）
+    nta_agg_gdf = gdf[[GROUP_FIELD, "geometry"]].dissolve(by=GROUP_FIELD, as_index=False)
+    nta_agg_gdf = nta_agg_gdf.merge(nta_agg, on=GROUP_FIELD, how="left", validate="1:1")
 
-# 把聚合结果和聚合层级的**几何**合并（ dissolve 只保留几何；属性用我们算的）
-geoms = joined[[GROUP_FIELD, joined.geometry.name]].dissolve(by=GROUP_FIELD, as_index=False)
-agg_gdf = geoms.merge(grouped, on=GROUP_FIELD, how="left")
+    nta_agg_gdf.to_file(OUT_GPKG_NTA, layer="nta_acs", driver="GPKG")
+    logging.info(f"Saved NTA aggregate → {OUT_GPKG_NTA}::nta_acs")
 
-# 和 CRS 保持一致
-agg_gdf.set_crs(joined.crs, inplace=True)
+    # 13) 额外导出一个 CSV 便于快速 eyeballing
+    (OUT_GPKG_NTA.parent / "nta_acs_preview.csv").write_text(
+        nta_agg.head(50).to_csv(index=False)
+    )
+    logging.info("Preview CSV exported (前 50 行).")
 
-# 输出聚合结果
-agg_gdf.to_file(OUT_AGG, layer=f"agg_by_{GROUP_FIELD.lower()}", driver="GPKG")
-print(f"✓ 聚合完成：{OUT_AGG}::agg_by_{GROUP_FIELD.lower()}")
+if __name__ == "__main__":
+    main()
+# %%
