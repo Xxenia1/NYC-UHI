@@ -1,9 +1,0 @@
-# large geodata – keep out of git
-*.tif
-*.gpkg
-*.shp
-*.dbf
-*.shx
-*.cpg
-*.prj
-Data_fetch/nyc_tree_census_2015.*
